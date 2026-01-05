@@ -1,45 +1,98 @@
-name: MLOps CI Pipeline
+name: MLOps CI/CD/CT Pipeline
 
 on:
-  push:
-    branches: [ "develop" ]
+  workflow_dispatch:
+  # push:
+  #   branches: [ "develop" ]
   pull_request:
-    branches: [ "develop" ]
+    branches: ["develop"]
 
 jobs:
-  build-test-train:
+  build-test-train-deploy:
     runs-on: ubuntu-latest
 
     steps:
+    # 1. Checkout Code
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # 2. Set up Python
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.10"
 
+    # 3. Install dependencies
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest flake8
+        # We need dvc and dagshub mlflow for the data pull step below
+        pip install dvc dvc-s3 dagshub mlflow flake8 black pytest pytest-cov
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
+    # 4. Lint code
+    # - name: Lint code (Black)
+    #   run: black --check --diff .
+    
     - name: Lint code (Flake8)
       run: |
         flake8 src app tests --count --select=E9,F63,F7,F82 --show-source --statistics
         flake8 src app tests --count --exit-zero --max-complexity=10 --statistics
 
-    - name: Run unit tests
+    # 5. Run Unit Tests
+    - name: Run unit tests with coverage
       run: |
-        pytest tests/
+        pytest tests/ -v --cov=src --cov-report=xml
 
+    - name: Upload coverage report
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: coverage.xml
+    
+    # 6. DVC Pull (Get the data)
+    - name: Pull Data from DagsHub (DVC)
+      env:
+        DAGSHUB_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+        DAGSHUB_TOKEN: ${{ secrets.DAGSHUB_TOKEN }}
+      run: |
+        dvc remote modify origin --local auth basic
+        dvc remote modify origin --local user $DAGSHUB_USERNAME
+        dvc remote modify origin --local password $DAGSHUB_TOKEN
+        dvc pull -r origin
+
+    # 7. Train Model (Train & Log to Registry)
     - name: Train model
+      env:
+        MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+        MLFLOW_TRACKING_USERNAME: ${{ secrets.DAGSHUB_USERNAME }}
+        MLFLOW_TRACKING_PASSWORD: ${{ secrets.DAGSHUB_TOKEN }}
       run: |
         python src/train.py
 
-    - name: Upload trained model artifact
+    # 8. Docker Build & Push (Continuous Deployment)
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Login to Docker Hub
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Build and Push Docker Image
+      if: github.event_name != 'pull_request'
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: ${{ secrets.DOCKER_USERNAME }}/heart-disease-api:latest
+
+    # 9. Log to GitHub Artifactory
+    - name: Upload logs
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: trained-model
-        path: models/heart_model.pkl
+        name: logs
+        path: logs/

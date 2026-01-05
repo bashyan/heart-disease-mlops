@@ -1,7 +1,7 @@
 mlflow-skinny
 numpy
 pandas
-scikit-learn
+scikit-learn==1.6.1
 matplotlib
 seaborn
 joblib
@@ -13,3 +13,11 @@ prometheus-client
 python-json-logger
 structlog
 python-multipart
+dagshub
+dvc
+dvc-s3
+python-dotenv
+flake8
+black
+pytest-cov
+httpx

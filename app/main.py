@@ -10,42 +10,84 @@ import time
 import json
 from datetime import datetime
 import sys
+import os
 from pathlib import Path
+import mlflow.sklearn
+from dotenv import load_dotenv
 
 # Add src directory to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from src.logging_config import setup_logging, get_logger
-from src.metrics import (
-    track_api_call, track_prediction, update_risk_distribution,
-    set_model_loaded, request_size, response_size, active_requests,
-    error_count, prediction_latency
-)
+# Try-except block to handle missing src modules if running in isolation
+try:
+    from src.logging_config import setup_logging, get_logger
+    from src.metrics import (
+        track_api_call, track_prediction, update_risk_distribution,
+        set_model_loaded, request_size, response_size, active_requests,
+        error_count, prediction_latency
+    )
+    # Setup logging
+    setup_logging()
+    logger = get_logger("app")
+except ImportError:
+    # Fallback logging if src modules aren't found (e.g. during CI test)
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("app")
+    # Mock decorator if metrics missing
+    def track_api_call(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    def set_model_loaded(status): pass
+    def update_risk_distribution(pred, prob): pass
+    # Mock metrics objects
+    class MockMetric:
+        def labels(self, **kwargs): return self
+        def observe(self, val): pass
+        def inc(self): pass
+    request_size = response_size = error_count = prediction_latency = MockMetric()
 
-# Setup logging
-setup_logging()
-logger = get_logger("app")
 
 # --------------------------------------------------
 # Initialize FastAPI app
 # --------------------------------------------------
 app = FastAPI(
     title="Heart Disease Risk Prediction API",
-    description="Predicts the risk of heart disease using a trained ML model",
+    description="Predicts the risk of heart disease using a trained ML model (Registry-Based)",
     version="1.0"
 )
 
 # --------------------------------------------------
-# Load trained model (includes preprocessing)
+# Load trained model (UPDATED: From DagsHub ML Flow Registry)
 # --------------------------------------------------
+load_dotenv() # Load env vars for local/colab testing
+
 try:
-    model = joblib.load("models/heart_model.pkl")
-    logger.info("Model loaded successfully")
+    logger.info("Attempting to load model from DagsHub Registry...")
+    
+    # 1. Define Model URI (Production Stage)
+    # This pulls the model you promoted to 'Production' in DagsHub
+    model_uri = "models:/HeartDisease_Model/Production"
+    
+    # 2. Load Model
+    # Note: This requires MLFLOW_TRACKING_URI and credentials to be set in env
+    model = mlflow.sklearn.load_model(model_uri)
+    
+    logger.info(f"Successfully loaded model from {model_uri}")
     set_model_loaded(True)
+
 except Exception as e:
-    logger.error(f"Failed to load model: {str(e)}")
-    set_model_loaded(False)
-    model = None
+    logger.error(f"Failed to load Production model: {str(e)}")
+    logger.warning("Attempting fallback to 'None' stage (Latest Version)...")
+    try:
+        # Fallback: Load the very latest version if Production isn't set yet
+        model = mlflow.sklearn.load_model("models:/HeartDisease_Model/None")
+        logger.info("Loaded latest model version (Stage: None)")
+        set_model_loaded(True)
+    except Exception as e2:
+        logger.critical(f"FATAL: Could not load any model. Error: {str(e2)}")
+        set_model_loaded(False)
+        model = None
 
 # --------------------------------------------------
 # Input schema (matches training features)
@@ -202,7 +244,14 @@ def predict(data: PatientData):
         # Make prediction
         inference_start = time.time()
         prediction = model.predict(input_data)[0]
-        probability = model.predict_proba(input_data)[0][1]
+        
+        # Check if model supports probabilities (LogisticRegression/RandomForest do)
+        if hasattr(model, "predict_proba"):
+            probability = model.predict_proba(input_data)[0][1]
+        else:
+            # Fallback if a model without probabilities is registered
+            probability = float(prediction) 
+            
         inference_duration = (time.time() - inference_start) * 1000  # milliseconds
         
         # Update metrics
@@ -224,7 +273,8 @@ def predict(data: PatientData):
             "heart_disease_risk": int(prediction),
             "risk_probability": round(float(probability), 3),
             "inference_time_ms": round(inference_duration, 2),
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "model_source": "DagsHub ML Flow Registry"
         }
         
         total_duration = (time.time() - start_time) * 1000
@@ -282,7 +332,8 @@ def detailed_health():
         "status": "healthy",
         "model_loaded": model is not None,
         "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0"
+        "version": "1.0",
+        "registry_source": "DagsHub"
     }
 
 
